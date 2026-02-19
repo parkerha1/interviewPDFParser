@@ -335,6 +335,45 @@ def find_scoped_unit_context(sections: list[UnitSection], y: float) -> Multiplie
     return None
 
 
+_LABEL_COL_THRESHOLD = 0.5  # a column is "label" if >50% of overlapping tokens are text
+
+
+def _is_token_textual(token: Token) -> bool:
+    """Return True if *token* is predominantly text rather than a number."""
+    stripped = token.text.replace(",", "").replace(".", "").replace("-", "").replace("(", "").replace(")", "")
+    if not stripped:
+        return True
+    return not stripped.isdigit()
+
+
+def is_in_label_column(lines: list[Line], x0: float, x1: float, _cache: dict | None = None) -> bool:
+    """Return True if the vertical slice at [x0, x1] is predominantly text.
+
+    Scans all tokens on all lines that overlap the x-range and checks whether
+    the majority are text rather than numbers. A cache keyed by rounded x0
+    avoids redundant work for numbers at the same column position.
+    """
+    if _cache is not None:
+        key = round(x0, 0)
+        if key in _cache:
+            return _cache[key]
+
+    text_count = 0
+    total = 0
+    for line in lines:
+        for token in line.tokens:
+            if token.x1 >= x0 and token.x0 <= x1:
+                total += 1
+                if _is_token_textual(token):
+                    text_count += 1
+
+    result = (text_count / total > _LABEL_COL_THRESHOLD) if total > 0 else False
+
+    if _cache is not None:
+        _cache[round(x0, 0)] = result
+    return result
+
+
 _YEAR_PREFIX_RE = re.compile(r"^(FY|CY)\d{2,4}$", re.IGNORECASE)
 
 
@@ -481,8 +520,13 @@ def process_page(
     numbers = extract_numbers(lines, page.page_number, page_text, include_negatives)
     unit_sections = build_unit_sections(lines, page)
 
+    label_col_cache: dict[float, bool] = {}
     results: list[tuple[NumberMatch, Multiplier]] = []
     for nm in numbers:
+        if is_in_label_column(lines, nm.x0, nm.x1, label_col_cache):
+            results.append((nm, Multiplier(factor=1, evidence="label column")))
+            continue
+
         col_header = find_column_header(lines, nm.y, nm.x0, nm.x1)
         unit_ctx = find_scoped_unit_context(unit_sections, nm.y)
         inline = detect_inline_multiplier(page_text, nm.position)
