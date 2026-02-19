@@ -14,6 +14,8 @@ Two-stage pipeline:
 
 from __future__ import annotations
 
+import argparse
+import heapq
 import logging
 import re
 import sys
@@ -135,16 +137,21 @@ _NEGATIVE_RE = re.compile(r"\(\s*([\d,]+\.?\d*)\s*\)")
 _UNIT_SUFFIXES = frozenset("MKBTmkbt")
 
 
-def extract_numbers(lines: list[Line], page_number: int, page_text: str) -> list[NumberMatch]:
-    """Return every positive number found in *lines*.
+def extract_numbers(
+    lines: list[Line],
+    page_number: int,
+    page_text: str,
+    include_negatives: bool = False,
+) -> list[NumberMatch]:
+    """Return numbers found in *lines*.
 
-    Uses x/y coordinates from each Line's tokens for context resolution later.
-    The flat *page_text* is used to compute the character offset (position) needed
-    by detect_inline_multiplier.
+    By default only positive numbers are returned. When *include_negatives* is
+    True, accounting-notation negatives like ``(364.7)`` are included with
+    negative values.
     """
-    negative_spans: set[tuple[int, int]] = set()
+    negative_spans: dict[tuple[int, int], str] = {}
     for m in _NEGATIVE_RE.finditer(page_text):
-        negative_spans.add((m.start(), m.end()))
+        negative_spans[(m.start(), m.end())] = m.group(1)
 
     results: list[NumberMatch] = []
 
@@ -157,8 +164,6 @@ def extract_numbers(lines: list[Line], page_number: int, page_text: str) -> list
                 if token_raw.replace(",", "").replace(".", "") == "":
                     continue
 
-                # Reject numbers embedded in alphanumeric codes (e.g. "0708055F")
-                # but allow unit suffixes like M/K/B/T
                 before_char = raw[m.start() - 1] if m.start() > 0 else ""
                 after_char = raw[m.end()] if m.end() < len(raw) else ""
                 if before_char.isalpha() and before_char not in _UNIT_SUFFIXES:
@@ -175,18 +180,18 @@ def extract_numbers(lines: list[Line], page_number: int, page_text: str) -> list
                 if value == 0:
                     continue
 
-                # Find this token's character offset in the flat page text so
-                # detect_inline_multiplier can scan forward from it
                 position = page_text.find(token_raw)
 
-                # Skip if inside an accounting-negative span in the flat text
-                if any(position >= ns and position + len(token_raw) <= ne
-                       for ns, ne in negative_spans):
+                is_negative = any(
+                    position >= ns and position + len(token_raw) <= ne
+                    for ns, ne in negative_spans
+                )
+                if is_negative and not include_negatives:
                     continue
 
                 results.append(NumberMatch(
-                    value=value,
-                    raw_text=token_raw,
+                    value=-value if is_negative else value,
+                    raw_text=f"({token_raw})" if is_negative else token_raw,
                     position=position,
                     page_number=page_number,
                     x0=token.x0,
@@ -463,14 +468,17 @@ def resolve_multiplier(
 # Pipeline
 # ---------------------------------------------------------------------------
 
-def process_page(page: pdfplumber.page.Page) -> list[tuple[NumberMatch, Multiplier]]:
+def process_page(
+    page: pdfplumber.page.Page,
+    include_negatives: bool = False,
+) -> list[tuple[NumberMatch, Multiplier]]:
     """Extract all numbers from *page* and resolve each one's unit multiplier."""
     page_text = page.extract_text() or ""
     if not page_text.strip():
         return []
 
     lines = chars_to_lines(page.chars)
-    numbers = extract_numbers(lines, page.page_number, page_text)
+    numbers = extract_numbers(lines, page.page_number, page_text, include_negatives)
     unit_sections = build_unit_sections(lines, page)
 
     results: list[tuple[NumberMatch, Multiplier]] = []
@@ -491,18 +499,40 @@ def snippet(text: str, position: int, radius: int = 60) -> str:
     return f"...{text[start:end].replace(chr(10), ' ')}..."
 
 
-def find_largest(pdf_path: str) -> None:
+def _print_entry(
+    rank: int,
+    label: str,
+    nm: NumberMatch,
+    mult: Multiplier,
+    adjusted: float,
+    page_texts: dict[int, str],
+    verbose: bool,
+) -> None:
+    """Print one result entry."""
+    prefix = f"  #{rank}" if rank else " "
+    print(f"{prefix} {label}: {adjusted:>24,.2f}")
+    print(f"      Raw text:    {nm.raw_text!r}  (page {nm.page_number})")
+    if verbose:
+        print(f"      Multiplier:  {mult.factor:,.0f}x  ({mult.evidence})")
+        if nm.page_number in page_texts:
+            print(f"      Context:     {snippet(page_texts[nm.page_number], nm.position)}")
+
+
+def find_largest(
+    pdf_path: str,
+    top_n: int = 1,
+    include_negatives: bool = False,
+    verbose: bool = False,
+) -> None:
     path = Path(pdf_path)
     if not path.exists():
         print(f"Error: file not found: {path}", file=sys.stderr)
         sys.exit(1)
 
-    raw_max: NumberMatch | None = None
-    adj_max_value: float = 0.0
-    adj_max_match: NumberMatch | None = None
-    adj_max_mult: Multiplier | None = None
-
+    raw_heap: list[tuple[float, int, NumberMatch]] = []
+    adj_heap: list[tuple[float, int, NumberMatch, Multiplier]] = []
     page_texts: dict[int, str] = {}
+    counter = 0
 
     with pdfplumber.open(path) as pdf:
         for page in pdf.pages:
@@ -510,35 +540,46 @@ def find_largest(pdf_path: str) -> None:
             if page_text.strip():
                 page_texts[page.page_number] = page_text
 
-            for nm, mult in process_page(page):
-                if raw_max is None or nm.value > raw_max.value:
-                    raw_max = nm
-
+            for nm, mult in process_page(page, include_negatives):
+                counter += 1
                 adjusted = nm.value * mult.factor
-                if adjusted > adj_max_value:
-                    adj_max_value = adjusted
-                    adj_max_match = nm
-                    adj_max_mult = mult
+                raw_key = abs(nm.value) if include_negatives else nm.value
+                adj_key = abs(adjusted) if include_negatives else adjusted
+
+                if len(raw_heap) < top_n:
+                    heapq.heappush(raw_heap, (raw_key, counter, nm))
+                elif raw_key > raw_heap[0][0]:
+                    heapq.heapreplace(raw_heap, (raw_key, counter, nm))
+
+                if len(adj_heap) < top_n:
+                    heapq.heappush(adj_heap, (adj_key, counter, nm, mult))
+                elif adj_key > adj_heap[0][0]:
+                    heapq.heapreplace(adj_heap, (adj_key, counter, nm, mult))
 
     print("=" * 64)
     print("RESULTS")
     print("=" * 64)
 
-    if raw_max is None:
+    if not raw_heap:
         print("No numbers found in the document.")
         return
 
-    print(f"\nLargest raw number:      {raw_max.value:,.2f}")
-    print(f"  Raw text:              {raw_max.raw_text!r}")
-    print(f"  Page:                  {raw_max.page_number}")
-    print(f"  Context:               {snippet(page_texts[raw_max.page_number], raw_max.position)}")
+    raw_sorted = sorted(raw_heap, key=lambda t: t[0], reverse=True)
+    adj_sorted = sorted(adj_heap, key=lambda t: t[0], reverse=True)
 
-    if adj_max_match and adj_max_mult:
-        print(f"\nLargest adjusted number: {adj_max_value:,.2f}")
-        print(f"  Raw text:              {adj_max_match.raw_text!r}")
-        print(f"  Multiplier:            {adj_max_mult.factor:,.0f}x ({adj_max_mult.evidence})")
-        print(f"  Page:                  {adj_max_match.page_number}")
-        print(f"  Context:               {snippet(page_texts[adj_max_match.page_number], adj_max_match.position)}")
+    show_rank = top_n > 1
+    neg_note = " (including negatives by magnitude)" if include_negatives else ""
+
+    print(f"\nLargest raw number{'s' if top_n > 1 else ''}{neg_note}:\n")
+    for i, (val, _, nm) in enumerate(raw_sorted, 1):
+        no_mult = Multiplier(factor=1, evidence="raw")
+        _print_entry(i if show_rank else 0, "Raw", nm, no_mult, nm.value,
+                     page_texts, verbose)
+
+    print(f"\nLargest adjusted number{'s' if top_n > 1 else ''}{neg_note}:\n")
+    for i, (adj_val, _, nm, mult) in enumerate(adj_sorted, 1):
+        _print_entry(i if show_rank else 0, "Adjusted", nm, mult, adj_val,
+                     page_texts, verbose)
 
     print()
 
@@ -547,9 +588,34 @@ def find_largest(pdf_path: str) -> None:
 # CLI
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print(f"Usage: python {sys.argv[0]} <path-to-pdf>", file=sys.stderr)
-        sys.exit(1)
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Find the largest numerical value in a PDF document.",
+    )
+    parser.add_argument("pdf", help="Path to the PDF file")
+    parser.add_argument(
+        "-n", "--top-n",
+        type=int, default=1, metavar="N",
+        help="Show the top N largest numbers (default: 1)",
+    )
+    parser.add_argument(
+        "--include-negatives",
+        action="store_true",
+        help="Include accounting-notation negatives like (364.7)",
+    )
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Show multiplier evidence and context for each result",
+    )
+    return parser
 
-    find_largest(sys.argv[1])
+
+if __name__ == "__main__":
+    args = _build_parser().parse_args()
+    find_largest(
+        args.pdf,
+        top_n=args.top_n,
+        include_negatives=args.include_negatives,
+        verbose=args.verbose,
+    )
