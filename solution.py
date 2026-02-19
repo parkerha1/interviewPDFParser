@@ -1,12 +1,15 @@
 """Find the largest numerical value in a PDF document.
 
 Two-stage pipeline:
-  1. extract_numbers  – extracts all positive numbers from page.chars, each carrying
-                        its rendered x/y coordinates for context resolution
-  2. process_page     – for each number, scans upward using real coordinates to find:
-                          a) the nearest column header (x-aligned)
-                          b) the nearest unit keyword (when in a table context)
-                        then applies a specificity hierarchy to determine the multiplier
+  1. extract_numbers      – extracts all positive numbers from page.chars, each
+                            carrying its rendered x/y coordinates for context resolution
+  2. process_page         – for each number:
+       a) find_column_header       – scan upward for the nearest x-aligned header
+       b) find_scoped_unit_context – match against spatially-scoped unit sections
+          (unit headers like "(Dollars in Millions)" are bounded by horizontal rules
+          so they only apply to numbers within their table section, not the whole page)
+       c) detect_inline_multiplier – check for inline unit words after the number
+       d) resolve_multiplier       – apply specificity hierarchy
 """
 
 from __future__ import annotations
@@ -233,17 +236,130 @@ def find_unit_context(lines: list[Line], y: float) -> Multiplier | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Stage 2 – spatial section scoping via horizontal rules
+# ---------------------------------------------------------------------------
+
+_HEADER_RULE_GAP = 30  # pt — consecutive rules within this gap are header borders
+
+
+@dataclass
+class UnitSection:
+    """A unit header and the y-range it owns on a page."""
+    y_header: float
+    factor: float
+    evidence: str
+    data_start: float
+    section_end: float
+
+
+def get_horizontal_rules(page: pdfplumber.page.Page, min_width_frac: float = 0.3) -> list[float]:
+    """Return sorted, deduplicated y-positions of horizontal rules on *page*.
+
+    Only includes rules wider than *min_width_frac* of the page width.
+    Rules within 3pt of each other are merged.
+    """
+    min_width = page.width * min_width_frac
+    rule_ys: set[float] = set()
+    for edge in (page.edges or []):
+        if abs(edge.get("top", 0) - edge.get("bottom", 0)) < 2:
+            if edge.get("x1", 0) - edge.get("x0", 0) >= min_width:
+                rule_ys.add(round(edge["top"], 1))
+
+    deduped: list[float] = []
+    for y in sorted(rule_ys):
+        if not deduped or y - deduped[-1] > 3:
+            deduped.append(y)
+    return deduped
+
+
+def _find_unit_scope(rules: list[float], y_unit: float, page_height: float) -> tuple[float, float]:
+    """Determine the data y-range that a unit header at *y_unit* owns.
+
+    The scope extends downward from the last "header rule" (consecutive rules
+    within _HEADER_RULE_GAP of each other immediately below the header) to the
+    next rule after that (or the page bottom).
+    """
+    rules_below = [r for r in rules if r > y_unit]
+    if not rules_below:
+        return y_unit, page_height
+
+    header_rules = [rules_below[0]]
+    for r in rules_below[1:]:
+        if r - header_rules[-1] <= _HEADER_RULE_GAP:
+            header_rules.append(r)
+        else:
+            break
+
+    data_start = header_rules[-1]
+    remaining = [r for r in rules_below if r > data_start]
+    section_end = remaining[0] if remaining else page_height
+
+    return data_start, section_end
+
+
+def build_unit_sections(lines: list[Line], page: pdfplumber.page.Page) -> list[UnitSection]:
+    """Find all unit headers on *page* and compute the section each one owns."""
+    rules = get_horizontal_rules(page)
+    sections: list[UnitSection] = []
+    for line in lines:
+        factor = _parse_unit_from_text(line.full_text)
+        if factor is not None:
+            data_start, section_end = _find_unit_scope(rules, line.y, page.height)
+            sections.append(UnitSection(
+                y_header=line.y,
+                factor=factor,
+                evidence=f"scoped unit header: {line.full_text!r}",
+                data_start=data_start,
+                section_end=section_end,
+            ))
+    return sections
+
+
+def find_scoped_unit_context(sections: list[UnitSection], y: float) -> Multiplier | None:
+    """Return the unit Multiplier if *y* falls within any UnitSection's scope.
+
+    A number is in scope if it is on the header line itself or between
+    data_start and section_end.
+    """
+    for sec in sections:
+        on_header = abs(y - sec.y_header) < 2
+        in_section = sec.data_start < y < sec.section_end
+        if on_header or in_section:
+            return Multiplier(factor=sec.factor, evidence=sec.evidence)
+    return None
+
+
+_YEAR_PREFIX_RE = re.compile(r"^(FY|CY)\d{2,4}$", re.IGNORECASE)
+
+
+def _is_pure_numeric_token(token: Token, prev_token: Token | None) -> bool:
+    """Return True if *token* looks like a data number rather than a label.
+
+    Fiscal/calendar year labels like 'FY2025' (single token) or '2025' preceded
+    by an 'FY'/'CY' token are treated as labels, not data numbers.
+    """
+    stripped = token.text.replace(",", "").replace(".", "").replace("-", "")
+    if not stripped.isdigit():
+        return False
+    if _YEAR_PREFIX_RE.match(token.text):
+        return False
+    if prev_token is not None and prev_token.text.upper() in ("FY", "CY"):
+        return False
+    return True
+
+
 def _is_header_like(line: Line) -> bool:
     """Return True if the line looks like a column header rather than data.
 
-    Heuristic: fewer than 30% of tokens parse as pure numbers.
+    Heuristic: fewer than 30% of tokens parse as pure data numbers.
     A header line mostly contains labels; a data line mostly contains numbers.
     """
     if not line.tokens:
         return False
     numeric_count = sum(
-        1 for t in line.tokens
-        if t.text.replace(",", "").replace(".", "").replace("-", "").isdigit()
+        1 for i, t in enumerate(line.tokens)
+        if _is_pure_numeric_token(t, line.tokens[i - 1] if i > 0 else None)
     )
     return numeric_count / len(line.tokens) < 0.3
 
@@ -355,13 +471,14 @@ def process_page(page: pdfplumber.page.Page) -> list[tuple[NumberMatch, Multipli
 
     lines = chars_to_lines(page.chars)
     numbers = extract_numbers(lines, page.page_number, page_text)
+    unit_sections = build_unit_sections(lines, page)
 
     results: list[tuple[NumberMatch, Multiplier]] = []
     for nm in numbers:
         col_header = find_column_header(lines, nm.y, nm.x0, nm.x1)
-        unit_ctx   = find_unit_context(lines, nm.y)
-        inline     = detect_inline_multiplier(page_text, nm.position)
-        mult       = resolve_multiplier(col_header, unit_ctx, inline)
+        unit_ctx = find_scoped_unit_context(unit_sections, nm.y)
+        inline = detect_inline_multiplier(page_text, nm.position)
+        mult = resolve_multiplier(col_header, unit_ctx, inline)
         results.append((nm, mult))
 
     return results
