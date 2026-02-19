@@ -21,7 +21,7 @@ import re
 import sys
 import warnings
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import pdfplumber
@@ -149,11 +149,12 @@ def extract_numbers(
     True, accounting-notation negatives like ``(364.7)`` are included with
     negative values.
     """
-    negative_spans: dict[tuple[int, int], str] = {}
-    for m in _NEGATIVE_RE.finditer(page_text):
-        negative_spans[(m.start(), m.end())] = m.group(1)
+    negative_spans: list[tuple[int, int]] = [
+        (m.start(), m.end()) for m in _NEGATIVE_RE.finditer(page_text)
+    ]
 
     results: list[NumberMatch] = []
+    search_offset = 0
 
     for line in lines:
         for token in line.tokens:
@@ -180,7 +181,11 @@ def extract_numbers(
                 if value == 0:
                     continue
 
-                position = page_text.find(token_raw)
+                position = page_text.find(token_raw, search_offset)
+                if position == -1:
+                    position = page_text.find(token_raw)
+                else:
+                    search_offset = position + len(token_raw)
 
                 is_negative = any(
                     position >= ns and position + len(token_raw) <= ne
@@ -228,24 +233,13 @@ def _parse_unit_from_text(text: str) -> float | None:
     return None
 
 
-def find_unit_context(lines: list[Line], y: float) -> Multiplier | None:
-    """Scan lines above *y* (closest first) for the nearest unit keyword.
-
-    Returns the first matching Multiplier, or None if no unit keyword is found above.
-    """
-    above = [ln for ln in lines if ln.y < y]
-    for ln in reversed(above):
-        factor = _parse_unit_from_text(ln.full_text)
-        if factor is not None:
-            return Multiplier(factor=factor, evidence=f"unit header: {ln.full_text!r}")
-    return None
-
-
 # ---------------------------------------------------------------------------
 # Stage 2 – spatial section scoping via horizontal rules
 # ---------------------------------------------------------------------------
 
-_HEADER_RULE_GAP = 30  # pt — consecutive rules within this gap are header borders
+_HEADER_RULE_GAP = 30       # pt — consecutive rules within this gap are header borders
+_INLINE_SCAN_WINDOW = 60    # chars after a number to scan for inline unit words
+_COL_HEADER_TOKEN_GAP = 20  # px — max gap between adjacent tokens in a header phrase
 
 
 @dataclass
@@ -413,7 +407,7 @@ def find_column_header(lines: list[Line], y: float, x0: float, x1: float) -> str
 
     A qualifying header-like line must have at least one token whose x-range
     overlaps with [x0, x1]. When a match is found, we also collect immediately
-    adjacent tokens (gap ≤ 20px) to reconstruct multi-word column phrases like
+    adjacent tokens (gap ≤ _COL_HEADER_TOKEN_GAP px) to reconstruct multi-word column phrases like
     '$ Per Barrel' where only the last token spatially overlaps the data column.
     Returns the combined phrase text, or None.
     """
@@ -432,12 +426,11 @@ def find_column_header(lines: list[Line], y: float, x0: float, x1: float) -> str
         if match_idx is None:
             continue
 
-        # Expand left: collect adjacent tokens with gap ≤ 20px
         phrase_tokens = [ln.tokens[match_idx]]
         i = match_idx - 1
         while i >= 0:
             gap = phrase_tokens[0].x0 - ln.tokens[i].x1
-            if gap <= 20:
+            if gap <= _COL_HEADER_TOKEN_GAP:
                 phrase_tokens.insert(0, ln.tokens[i])
                 i -= 1
             else:
@@ -447,7 +440,7 @@ def find_column_header(lines: list[Line], y: float, x0: float, x1: float) -> str
         i = match_idx + 1
         while i < len(ln.tokens):
             gap = ln.tokens[i].x0 - phrase_tokens[-1].x1
-            if gap <= 20:
+            if gap <= _COL_HEADER_TOKEN_GAP:
                 phrase_tokens.append(ln.tokens[i])
                 i += 1
             else:
@@ -459,11 +452,11 @@ def find_column_header(lines: list[Line], y: float, x0: float, x1: float) -> str
 
 
 def detect_inline_multiplier(page_text: str, position: int) -> Multiplier | None:
-    """Scan ~60 chars after *position* in the flat page text for an inline unit word.
+    """Scan chars after *position* in the flat page text for an inline unit word.
 
     Handles phrases like '3.2 million dollars' or 'approximately $1.5 billion'.
     """
-    window = page_text[position: position + 60]
+    window = page_text[position: position + _INLINE_SCAN_WINDOW]
     m = _INLINE_UNIT_RE.search(window)
     if m:
         factor = _INLINE_FACTORS[m.group(1).lower()]
@@ -510,9 +503,11 @@ def resolve_multiplier(
 def process_page(
     page: pdfplumber.page.Page,
     include_negatives: bool = False,
+    page_text: str | None = None,
 ) -> list[tuple[NumberMatch, Multiplier]]:
     """Extract all numbers from *page* and resolve each one's unit multiplier."""
-    page_text = page.extract_text() or ""
+    if page_text is None:
+        page_text = page.extract_text() or ""
     if not page_text.strip():
         return []
 
@@ -584,7 +579,7 @@ def find_largest(
             if page_text.strip():
                 page_texts[page.page_number] = page_text
 
-            for nm, mult in process_page(page, include_negatives):
+            for nm, mult in process_page(page, include_negatives, page_text):
                 counter += 1
                 adjusted = nm.value * mult.factor
                 raw_key = abs(nm.value) if include_negatives else nm.value

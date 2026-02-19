@@ -4,7 +4,7 @@ Finds the largest numerical value in a PDF document, both as a raw number and ad
 
 ## Setup
 
-Requires Python 3.9+.
+Requires Python 3.10+.
 
 ```bash
 python3 -m venv .venv
