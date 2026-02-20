@@ -15,14 +15,15 @@ pip install -r requirements.txt
 ## Usage
 
 ```bash
-python solution.py
+python solution.py [pdf_path]
 ```
 
-The included PDF (`FY25 Air Force Working Capital Fund.pdf`) is used by default. The script outputs the largest raw number and the largest context-adjusted number found, along with the page and surrounding text for verification.
+If `pdf_path` is omitted, the included PDF (`FY25 Air Force Working Capital Fund.pdf`) is used by default. The script outputs the largest raw number and the largest context-adjusted number found, along with the page and surrounding text for verification.
 
 ### Options
 
 ```
+[pdf]                   Optional path to the PDF file
 -n N, --top-n N        Show the top N largest numbers (default: 1)
 --include-negatives    Include accounting-notation negatives like (364.7),
                        ranked by absolute magnitude
