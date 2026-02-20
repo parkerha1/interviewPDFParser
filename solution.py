@@ -9,7 +9,8 @@ Two-stage pipeline:
           (unit headers like "(Dollars in Millions)" are bounded by horizontal rules
           so they only apply to numbers within their table section, not the whole page)
        c) detect_inline_multiplier – check for inline unit words after the number
-       d) resolve_multiplier       – apply specificity hierarchy
+       d) find_same_row_unit       – check for unit keywords in the row's label column
+       e) resolve_multiplier       – apply specificity hierarchy
 """
 
 from __future__ import annotations
@@ -297,14 +298,13 @@ def _find_unit_scope(rules: list[float], y_unit: float, page_height: float) -> t
     return data_start, section_end
 
 
-def build_unit_sections(lines: list[Line], page: pdfplumber.page.Page) -> list[UnitSection]:
-    """Find all unit headers on *page* and compute the section each one owns."""
-    rules = get_horizontal_rules(page)
+def build_unit_sections(lines: list[Line], rules: list[float], page_height: float) -> list[UnitSection]:
+    """Find all unit headers on the page and compute the section each one owns."""
     sections: list[UnitSection] = []
     for line in lines:
         factor = _parse_unit_from_text(line.full_text)
         if factor is not None:
-            data_start, section_end = _find_unit_scope(rules, line.y, page.height)
+            data_start, section_end = _find_unit_scope(rules, line.y, page_height)
             sections.append(UnitSection(
                 y_header=line.y,
                 factor=factor,
@@ -340,21 +340,44 @@ def _is_token_textual(token: Token) -> bool:
     return not stripped.isdigit()
 
 
-def is_in_label_column(lines: list[Line], x0: float, x1: float, _cache: dict | None = None) -> bool:
+def _find_table_y_bounds(rules: list[float], y: float, page_height: float) -> tuple[float, float]:
+    """Return the (top, bottom) y-bounds of the table region containing *y*.
+
+    Uses horizontal rules as boundaries. When no rules exist above or below,
+    falls back to the page edges so behavior is unchanged for un-ruled content.
+    """
+    rule_above = max((r for r in rules if r <= y), default=0.0)
+    rule_below = min((r for r in rules if r > y), default=page_height)
+    return rule_above, rule_below
+
+
+def is_in_label_column(
+    lines: list[Line],
+    x0: float,
+    x1: float,
+    y: float,
+    rules: list[float],
+    page_height: float,
+    _cache: dict | None = None,
+) -> bool:
     """Return True if the vertical slice at [x0, x1] is predominantly text.
 
-    Scans all tokens on all lines that overlap the x-range and checks whether
-    the majority are text rather than numbers. A cache keyed by rounded x0
-    avoids redundant work for numbers at the same column position.
+    Only lines within the same table region (bounded by horizontal rules) are
+    considered, so prose and other tables on the page don't pollute the count.
+    A cache keyed by (rounded x0, y-bounds) avoids redundant work.
     """
+    y_top, y_bot = _find_table_y_bounds(rules, y, page_height)
+
     if _cache is not None:
-        key = round(x0, 0)
+        key = (round(x0, 0), y_top, y_bot)
         if key in _cache:
             return _cache[key]
 
     text_count = 0
     total = 0
     for line in lines:
+        if line.y < y_top or line.y > y_bot:
+            continue
         for token in line.tokens:
             if token.x1 >= x0 and token.x0 <= x1:
                 total += 1
@@ -364,7 +387,7 @@ def is_in_label_column(lines: list[Line], x0: float, x1: float, _cache: dict | N
     result = (text_count / total > _LABEL_COL_THRESHOLD) if total > 0 else False
 
     if _cache is not None:
-        _cache[round(x0, 0)] = result
+        _cache[(round(x0, 0), y_top, y_bot)] = result
     return result
 
 
@@ -451,6 +474,34 @@ def find_column_header(lines: list[Line], y: float, x0: float, x1: float) -> str
     return None
 
 
+def find_same_row_unit(
+    lines: list[Line],
+    y: float,
+    x0: float,
+    rules: list[float],
+    page_height: float,
+    label_col_cache: dict[tuple[float, float, float], bool] | None = None,
+) -> Multiplier | None:
+    """Check for a unit keyword in the first-column label on the same row as a number.
+
+    Only fires when the unit text is in a label column (predominantly text, not
+    data) so that stray unit words in data cells don't cause false positives.
+    """
+    for line in lines:
+        if abs(line.y - y) > 3:
+            continue
+        first_token = line.tokens[0] if line.tokens else None
+        if first_token is None or first_token.x0 >= x0:
+            continue
+        if not is_in_label_column(lines, first_token.x0, first_token.x1, y, rules, page_height, label_col_cache):
+            continue
+        left_text = " ".join(t.text for t in line.tokens if t.x1 <= x0)
+        factor = _parse_unit_from_text(left_text)
+        if factor is not None:
+            return Multiplier(factor=factor, evidence=f"same-row label: {left_text!r}")
+    return None
+
+
 def detect_inline_multiplier(page_text: str, position: int) -> Multiplier | None:
     """Scan chars after *position* in the flat page text for an inline unit word.
 
@@ -468,16 +519,18 @@ def resolve_multiplier(
     col_header: str | None,
     unit_ctx: Multiplier | None,
     inline_mult: Multiplier | None,
+    same_row: Multiplier | None = None,
 ) -> Multiplier:
     """Apply the specificity hierarchy to determine the multiplier for a number.
 
     1. Column header containing 'per'  → rate, multiplier = 1
     2. Column header containing a unit keyword → use that unit
     3. Inline cue immediately after the number
-    4. Column header found (any) + unit context above → use unit context
+    4. Same-row label containing a unit keyword (first/label column only)
+    5. Column header found (any) + unit context above → use unit context
        (col_header presence signals tabular context; prose numbers skip this step
         so they don't inherit a unit from an unrelated table elsewhere on the page)
-    5. No cue → multiplier = 1
+    6. No cue → multiplier = 1
     """
     if col_header is not None:
         if _PER_RE.search(col_header):
@@ -489,6 +542,9 @@ def resolve_multiplier(
 
     if inline_mult is not None:
         return inline_mult
+
+    if same_row is not None:
+        return same_row
 
     if col_header is not None and unit_ctx is not None:
         return unit_ctx
@@ -513,19 +569,21 @@ def process_page(
 
     lines = chars_to_lines(page.chars)
     numbers = extract_numbers(lines, page.page_number, page_text, include_negatives)
-    unit_sections = build_unit_sections(lines, page)
+    rules = get_horizontal_rules(page)
+    unit_sections = build_unit_sections(lines, rules, page.height)
 
-    label_col_cache: dict[float, bool] = {}
+    label_col_cache: dict[tuple[float, float, float], bool] = {}
     results: list[tuple[NumberMatch, Multiplier]] = []
     for nm in numbers:
-        if is_in_label_column(lines, nm.x0, nm.x1, label_col_cache):
+        if is_in_label_column(lines, nm.x0, nm.x1, nm.y, rules, page.height, label_col_cache):
             results.append((nm, Multiplier(factor=1, evidence="label column")))
             continue
 
         col_header = find_column_header(lines, nm.y, nm.x0, nm.x1)
         unit_ctx = find_scoped_unit_context(unit_sections, nm.y)
         inline = detect_inline_multiplier(page_text, nm.position)
-        mult = resolve_multiplier(col_header, unit_ctx, inline)
+        same_row = find_same_row_unit(lines, nm.y, nm.x0, rules, page.height, label_col_cache)
+        mult = resolve_multiplier(col_header, unit_ctx, inline, same_row)
         results.append((nm, mult))
 
     return results
@@ -551,8 +609,11 @@ def _print_entry(
     prefix = f"  #{rank}" if rank else " "
     print(f"{prefix} {label}: {adjusted:>24,.2f}")
     print(f"      Raw text:    {nm.raw_text!r}  (page {nm.page_number})")
-    if verbose:
+    if mult.factor != 1:
         print(f"      Multiplier:  {mult.factor:,.0f}x  ({mult.evidence})")
+    if verbose:
+        if mult.factor == 1:
+            print(f"      Multiplier:  1x  ({mult.evidence})")
         if nm.page_number in page_texts:
             print(f"      Context:     {snippet(page_texts[nm.page_number], nm.position)}")
 
@@ -627,11 +688,19 @@ def find_largest(
 # CLI
 # ---------------------------------------------------------------------------
 
+_DEFAULT_PDF = Path(__file__).parent / "FY25 Air Force Working Capital Fund.pdf"
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Find the largest numerical value in a PDF document.",
     )
-    parser.add_argument("pdf", help="Path to the PDF file")
+    parser.add_argument(
+        "pdf",
+        nargs="?",
+        default=str(_DEFAULT_PDF),
+        help=f"Path to the PDF file (default: {_DEFAULT_PDF.name!r})",
+    )
     parser.add_argument(
         "-n", "--top-n",
         type=int, default=1, metavar="N",

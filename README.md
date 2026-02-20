@@ -15,10 +15,10 @@ pip install -r requirements.txt
 ## Usage
 
 ```bash
-python solution.py "FY25 Air Force Working Capital Fund.pdf"
+python solution.py
 ```
 
-Pass any PDF path as the argument. The script outputs the largest raw number and the largest context-adjusted number found, along with the page and surrounding text for verification.
+The included PDF (`FY25 Air Force Working Capital Fund.pdf`) is used by default. The script outputs the largest raw number and the largest context-adjusted number found, along with the page and surrounding text for verification.
 
 ### Options
 
@@ -33,10 +33,13 @@ Pass any PDF path as the argument. The script outputs the largest raw number and
 
 ```bash
 # Top 5 largest, with full evidence trail
-python solution.py "FY25 Air Force Working Capital Fund.pdf" -n 5 -v
+python solution.py -n 5 -v
 
 # Include negatives, show top 10
-python solution.py "FY25 Air Force Working Capital Fund.pdf" -n 10 --include-negatives
+python solution.py -n 10 --include-negatives
+
+# Run against a different PDF
+python solution.py path/to/other.pdf -n 5 -v
 ```
 
 ## Notes
